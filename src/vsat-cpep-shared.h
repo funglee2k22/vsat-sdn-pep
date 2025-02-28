@@ -1,3 +1,6 @@
+#ifndef _XOPEN_SOURCE
+#define _XOPEN_SOURCE 700 /* required for glibc to use getaddrinfo, etc. */
+#endif
 #include <assert.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -43,6 +46,12 @@ static int setup_ctx_quic(char *cert_path, char *key_path);
 // QUIC stock and stream related functions 
 int create_udp_clt_socket(char *hostname, short port, struct sockaddr_storage *sa, socklen_t *salen);
 int create_quic_clt_stream(quicly_conn_t *client, quicly_stream_t *stream, char *host, struct sockaddr_storage *sa);
+/*
+ *  @brief create a UDP client socket used by QUIC
+ *  @param hostname the hostname of the server
+ *  @param port the listening port number of the server
+ */
+int create_quic_client(quicly_stream_t *stream, quicly_conn_t *client, struct sockaddr_storge *sa, socklen_t *salen, char *host, short port);
 
 int send_one(int fd, struct sockaddr *dest, struct iovec *vec);
 int get_original_dest_addr(int fd, struct sockaddr_storage *dst_addr);

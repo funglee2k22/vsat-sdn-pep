@@ -19,7 +19,7 @@
 #include "quicly.h"
 #include "quicly/defaults.h"
 #include "quicly/streambuf.h"
-#include "vsat-pep-shared.h" 
+#include "vsat-cpep-shared.h" 
 
 //global variables 
 static quicly_context_t ctx;  //the QUIC context
@@ -45,12 +45,14 @@ int create_tcp_listener(short port)
         return -1;
     }
 
+#ifdef IP_TRANSPARENT
     //SOL_IP is not defained on MacOS 
     if (setsockopt(fd, SOL_IP, IP_TRANSPARENT, &(int){1}, sizeof(int)) < 0) {  
         perror("setsockopt (IP_TRANSPARENT): ");
         close(fd);
         return -1;
     }
+#endif
 
     if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
         perror("bind");
@@ -67,61 +69,11 @@ int create_tcp_listener(short port)
     return fd;
 }
 
-
-
-static void on_stop_sending(quicly_stream_t *stream, int err)
-{
-    fprintf(stderr, "received STOP_SENDING: %" PRIu16 "\n", QUICLY_ERROR_GET_ERROR_CODE(err));
-    quicly_close(stream->conn, QUICLY_ERROR_FROM_APPLICATION_ERROR_CODE(0), "");
-}
-
-static void on_receive_reset(quicly_stream_t *stream, int err)
-{
-    fprintf(stderr, "received RESET_STREAM: %" PRIu16 "\n", QUICLY_ERROR_GET_ERROR_CODE(err));
-    quicly_close(stream->conn, QUICLY_ERROR_FROM_APPLICATION_ERROR_CODE(0), "");
-}
-
-static int on_stream_open(quicly_stream_open_t *self, quicly_stream_t *stream)
-{
-    static const quicly_stream_callbacks_t stream_callbacks = {
-        quicly_streambuf_destroy, quicly_streambuf_egress_shift, quicly_streambuf_egress_emit, on_stop_sending, on_receive,
-        on_receive_reset};
-    int ret;
-
-    if ((ret = quicly_streambuf_create(stream, sizeof(quicly_streambuf_t))) != 0)
-        return ret;
-    stream->callbacks = &stream_callbacks;
-    return 0;
-}
-
-static void on_receive(quicly_stream_t *stream, size_t off, const void *src, size_t len)
-{
-    /* read input to receive buffer */
-    if (quicly_streambuf_ingress_receive(stream, off, src, len) != 0)
-        return;
-
-    /* obtain contiguous bytes from the receive buffer */
-    ptls_iovec_t input = quicly_streambuf_ingress_get(stream);
-
-    fwrite(input.base, 1, input.len, stdout);
-    fflush(stdout);
-    
-    /* initiate connection close after receiving all data */
-    if (quicly_recvstate_transfer_complete(&stream->recvstate))
-        quicly_close(stream->conn, 0, "");
-    
-    /* remove used bytes from receive buffer */
-    quicly_streambuf_ingress_shift(stream, input.len);
-}
-
-static int on_stream_ready(quicly_stream_t *stream)
-{
-    /* send the input to the active stream */
-    assert(stream != NULL);
-    //TODO: implement this function
-    return 0;
-}
 /*
+    * load the private key from the file 
+    * @param psign_certificate the sign certificate
+    * @param key_path the path of the private key file 
+    * @return 0 on success, -1 on failure 
 */
 static int load_private_key(ptls_openssl_sign_certificate_t *psign_certificate, char *key_path)
 {
@@ -136,7 +88,7 @@ static int load_private_key(ptls_openssl_sign_certificate_t *psign_certificate, 
     
     if (pkey == NULL) {
         fprintf(stderr, "failed to load private key from file:%s\n", optarg);
-        exit(1);
+        return -1;
     }
             
     ptls_openssl_init_sign_certificate(psign_certificate, pkey);
@@ -155,10 +107,6 @@ static int load_certificates(ptls_context_t *tlsctx, char *cert_path)
     return 0; 
 }
 
-/*
- * setup the QUIC and quicly context
- * note: ctx is a global variable 
- */
 static int setup_ctx_quic(char *cert_path, char *key_path)
 {
     int ret = 0;
@@ -271,11 +219,12 @@ static int get_original_dest_addr(int fd, struct sockaddr_storage *dst_addr)
     socklen_t addrlen = sizeof(*dst_addr);
     int ret = 0;
 
-    //SOL_IP SO_ORGINAL_DST is only defined on Linux 
+#ifdef SO_ORGINAL_DST   
     if (ret = getsockopt(fd, SOL_IP, SO_ORIGINAL_DST, dst_addr, &addrlen) != 0) {
         perror("getsockopt(SO_ORIGINAL_DST) failed");
         return -1;
     }
+#endif 
 
     return ret;
 }
@@ -295,122 +244,59 @@ int send_quicly_msg(quicly_conn_t *conn, const void *data, size_t len)
     return 0;
 }
 
-/*
- *  thread to handle one set connections, TCP conn and QUIC conn 
- *  @param data the thread data 
- *  @return NULL
- */
-void *handle_client(void *data) 
+
+
+
+
+static void on_stop_sending(quicly_stream_t *stream, int err)
 {
-    thread_data_t *d = (thread_data_t *)data;
-    int clt_fd = d->tcp_sk;      //incoming TCP socket 
-    char *quic_srv = d->quic_srv;
-    short quic_port = d->quic_srv_port;
-    int ret = 0;
-
-    struct sockaddr_storage orig_dst;
-    if (get_original_dest_addr(clt_fd, &orig_dst) != 0) {
-        perror("failed to get original destination address");
-        goto error;
-    }
-
-    // create quic client, stream and connected to the QUIC server
-    quicly_stream_t *stream;
-    quicly_conn_t *client = NULL;
-    struct sockaddr_storage sa;
-    socklen_t salen;
-    ret = create_quic_client(stream, client, &sa, &salen, quic_srv, quic_port); 
-    if (ret != 0) {
-        perror("failed to create QUIC client");
-        goto error;
-    }
-
-    // send the first message (pep header) to the server, server will use this infor
-    // to a create a new TCP connection towards the Internet server.  
-    pep_header_t pep_header = { .addr = orig_dst };
-    
-    if (send_quicly_message(stream, (void *) &pep_header, sizeof(pep_header)) != 0) {
-        perror("failed to send PEP header");
-        goto error;
-    }
-
-    
-error:
-    close(clt_fd);
-    free(data);
-    return NULL;
+    fprintf(stderr, "received STOP_SENDING: %" PRIu16 "\n", QUICLY_ERROR_GET_ERROR_CODE(err));
+    quicly_close(stream->conn, QUICLY_ERROR_FROM_APPLICATION_ERROR_CODE(0), "");
 }
 
-
-int run_client_loop(int listen_fd, char *quic_srv, short quic_port)
+static void on_receive_reset(quicly_stream_t *stream, int err)
 {
-    struct sockaddr_in tcp_remote_addr;
-    socklen_t tcp_addr_len = sizeof(tcp_remote_addr); 
-    int ret = 0;
-    
-    while (1) { 
-        int client_fd = accept(listen_fd, (struct sockaddr *)&tcp_remote_addr, &tcp_addr_len);
-        if (client_fd < 0) {
-            perror("accept: ");
-            close(listen_fd);
-            return -1;
-        } 
-        printf("Accepted connection from %s:%d\n", inet_ntoa(tcp_remote_addr.sin_addr), ntohs(tcp_remote_addr.sin_port));
-        //create a new thread to handle the connection
-        pthread_t thread;
-        thread_data_t *data = (thread_data_t *)malloc(sizeof(data));
-        if (data == NULL) { 
-            perror("Failed to allocated memory for thread data. malloc: ");
-            close(client_fd);
-            continue;
-        } 
+    fprintf(stderr, "received RESET_STREAM: %" PRIu16 "\n", QUICLY_ERROR_GET_ERROR_CODE(err));
+    quicly_close(stream->conn, QUICLY_ERROR_FROM_APPLICATION_ERROR_CODE(0), "");
+}
 
-        data->tcp_sk = client_fd;
-        data->quic_srv = quic_srv; 
-        data->quic_srv_port = quic_port;
+static int on_stream_open(quicly_stream_open_t *self, quicly_stream_t *stream)
+{
+    static const quicly_stream_callbacks_t stream_callbacks = {
+        quicly_streambuf_destroy, quicly_streambuf_egress_shift, quicly_streambuf_egress_emit, on_stop_sending, on_receive,
+        on_receive_reset};
+    int ret;
 
-        if (pthread_create(&thread, NULL, handle_client, (void *)data) != 0) {
-            perror("Failed to create thread: ");
-            close(client_fd);
-            free(data);
-            continue;
-        }
-        pthread_detach(thread);
-    }
+    if ((ret = quicly_streambuf_create(stream, sizeof(quicly_streambuf_t))) != 0)
+        return ret;
+    stream->callbacks = &stream_callbacks;
     return 0;
 }
 
-int main(int argc, char **argv)
-{ 
-    char *host = "127.0.0.1";     //quic server address 
-    short port = 4433, tcp_listen_port = 443;   //port is quic server listening UDP port 
-    char *cert_path = "server.crt";
-    char *key_path = "server.key";
+static void on_receive(quicly_stream_t *stream, size_t off, const void *src, size_t len)
+{
+    /* read input to receive buffer */
+    if (quicly_streambuf_ingress_receive(stream, off, src, len) != 0)
+        return;
+
+    /* obtain contiguous bytes from the receive buffer */
+    ptls_iovec_t input = quicly_streambuf_ingress_get(stream);
+
+    fwrite(input.base, 1, input.len, stdout);
+    fflush(stdout);
     
-    int tcp_fd, quic_fd;  
-    quicly_stream_t *stream;
-    quicly_conn_t *client = NULL;
-    int ret = 0;
+    /* initiate connection close after receiving all data */
+    if (quicly_recvstate_transfer_complete(&stream->recvstate))
+        quicly_close(stream->conn, 0, "");
+    
+    /* remove used bytes from receive buffer */
+    quicly_streambuf_ingress_shift(stream, input.len);
+}
 
-    //TODO: resolve command line options and arguments
-    //setup the quic and quicly context 
-    //ctx is a global variable will be modifed by this function.  
-    if ((ret = setup_ctx_quic(cert_path, key_path)) != 0) {
-        fprintf(stderr, "failed to setup quic context: %d.\n", ret);
-        exit(1);
-    }
-
-    //create a TCP listener 
-    tcp_fd = create_tcp_listener(tcp_listen_port);
-    if (tcp_fd < 0) {
-        perror("failed to create TCP listener and terminating");
-        exit(1);
-    }
-
-    run_client_loop(tcp_fd, host, port); 
-
-    // TODO: add ing SIGNAL handling here
-    close(tcp_fd); 
-
+static int on_stream_ready(quicly_stream_t *stream)
+{
+    /* send the input to the active stream */
+    assert(stream != NULL);
+    //TODO: implement this function
     return 0;
 }
