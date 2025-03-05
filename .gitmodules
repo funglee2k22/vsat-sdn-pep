@@ -1,9 +1,6 @@
 [submodule "backend/quicly"]
 	path = backend/quicly
 	url = https://github.com/h2o/quicly.git
-[submodule "backend/qpep"]
-	path = backend/qpep
-	url = https://github.com/rbruenig/qperf.git
 [submodule "backend/qperf"]
 	path = backend/qperf
 	url = https://github.com/rbruenig/qperf.git
